@@ -199,7 +199,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
             if args.curiosity:
                 with torch.no_grad():
                     curiosity_reward, _ = \
-                        curiosity(torch.tensor(transform(state.__array__())).unsqueeze(0),
+                        curiosity(torch.tensor(transform(state.__array__())).unsqueeze(0).to(device),
                                   torch.tensor(transform(next_state.__array__())).unsqueeze(0).to(device),
                                   torch.tensor([action]).long().to(device))
                 episode_curiosity_reward += curiosity_reward

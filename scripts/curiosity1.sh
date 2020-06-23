@@ -4,4 +4,4 @@ source ../venv/bin/activate
 
 cd ..
 
-python train.py ddqn1 --curiosity --batch-norm &
+python train.py curiosity --curiosity --batch-norm &

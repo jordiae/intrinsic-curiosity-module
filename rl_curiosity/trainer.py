@@ -144,7 +144,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
     buffer = ReplayBuffer(capacity=args.replay_size, seed=args.seed)
 
     best_mean_reward = env.reward_range[0]
-    episodes_without_improvement = 0
+    updates_without_improvement = 0
 
     # Adapted from Mario Martin's Notebook
     epsilon_start = 1.0
@@ -171,6 +171,8 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
     updates = 0
     optimizations = 0
 
+    initial_counter = 0
+
     for episode in range(args.episodes):
         state = env.reset()
         frame_idx += 1
@@ -178,6 +180,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
         episode_curiosity_reward = 0.0
         steps = 0
         gamma = epsilon_by_episode(episode)
+
         while True:
             current_model.eval()
             if args.curiosity:
@@ -206,6 +209,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                                        curiosity_reward.numpy() if curiosity_reward is not None else None))
 
             if done:
+                initial_counter += 1
                 writer.add_scalar('Reward/train', episode_reward, episode + 1)
                 writer.add_scalar('Steps/train', steps, episode + 1)
                 writer.add_scalar('Gamma/train', gamma, episode + 1)
@@ -241,8 +245,9 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                 q_loss, curiosity_loss = optimize(transitions, current_model, target_model, optimizer, device,
                                                   args.gamma, args.criterion, curiosity, curiosity_optimizer)
 
-            mean_episode_set_rewards = episode_set_rewards / (args.optimize_freq-1)
-            mean_episode_set_steps = episode_set_steps / (args.optimize_freq-1)
+            denominator = args.optimize_freq-1 if optimizations > 0 else initial_counter
+            mean_episode_set_rewards = episode_set_rewards / denominator
+            mean_episode_set_steps = episode_set_steps / denominator
             writer.add_scalar('Mean-Reward/train', mean_episode_set_rewards, optimizations + 1)
             writer.add_scalar('Mean-Steps/train', mean_episode_set_steps, optimizations + 1)
             writer.add_scalar('Q-Loss/train', q_loss, optimizations + 1)
@@ -261,7 +266,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
             optimizations += 1
 
             if mean_episode_set_rewards > best_mean_reward:
-                episodes_without_improvement = 0
+                updates_without_improvement = 0
                 best_mean_reward = mean_episode_set_rewards
                 torch.save(current_model.state_dict(), os.path.join(exp_dir, 'checkpoint_best.pt'))
                 logging.info(f'NEW: Best mean reward: {best_mean_reward:.2f}')
@@ -269,19 +274,15 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                     logging.info('Reached max reward')
                     break
             else:
-                episodes_without_improvement += 1
+                updates_without_improvement += 1
                 logging.info(f'Best mean reward: {best_mean_reward:.2f}')
-                if args.early_stop != -1 and episodes_without_improvement == args.early_stop:
+                if args.early_stop != -1 and updates_without_improvement == args.early_stop:
                     break
-            logging.info(f'{episodes_without_improvement} episodes without improvement')
-        elif not buffer.full and episode % args.optimize_freq == 0:
-            # First iteration: buffer not full. This messes up the logs (no other effect).
-            episode_set_rewards = 0.0
-            episode_set_steps = 0.0
+            logging.info(f'{updates_without_improvement} updates without improvement')
 
         if buffer.full and (episode+1) % args.update_target_freq == 0:
             target_model.load_state_dict(current_model.state_dict())
-            logging.info(f'Updated target model (updates {updates})')
+            logging.info(f'Updated target model (updates {updates+1})')
             updates += 1
 
     t1 = time.time()

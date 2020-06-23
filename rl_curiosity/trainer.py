@@ -28,6 +28,14 @@ def optimize(transitions: List[EagerTransition], current_model: nn.Module, targe
     states, actions, new_states, rewards, dones, predicted_next_state_loss, = \
         tuple(map(lambda x: np.array(list(x)), zip(*transitions)))
 
+    states = np.array(states, dtype=np.float32)
+    actions = np.array(actions, dtype=np.uint8)
+    new_states = np.array(new_states, dtype=np.float32)
+    rewards = np.array(rewards, dtype=np.float32)
+    dones = np.array(dones, dtype=np.uint8)
+    predicted_next_state_loss = np.array(predicted_next_state_loss, dtype=np.float32) \
+        if predicted_next_state_loss is not None else None
+
     current_model.train()
 
     if not curiosity:

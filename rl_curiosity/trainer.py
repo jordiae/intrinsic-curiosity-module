@@ -12,25 +12,43 @@ import os
 import gym
 from gym import wrappers
 import math
-from typing import List
+from typing import List, Optional, Tuple
 import torch.nn.functional as F
 import dataclasses
 from rl_curiosity.utils import evaluate
 from pprint import pformat
 
-# Some parts are adapted from https://github.com/dxyang/DQN_pytorch/blob/master/learn.py
+# Some parts are inspired by https://github.com/dxyang/DQN_pytorch/blob/master/learn.py
 
 
 def optimize(transitions: List[EagerTransition], current_model: nn.Module, target_model: nn.Module,
-             optimizer, device: torch.device, gamma: float, loss_function: str) -> torch.Tensor:
+             optimizer, device: torch.device, gamma: float, loss_function: str, curiosity: Optional[nn.Module] = None,
+             curiosity_optimizer: Optional = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     transitions = [dataclasses.astuple(t) for t in transitions]
-    states, actions, new_states, rewards, dones = tuple(map(lambda x: np.array(list(x)), zip(*transitions)))
-    states, actions, new_states, rewards, dones = (torch.tensor(states).to(device),
-                                                   torch.tensor(actions).long().to(device),
-                                                   torch.tensor(new_states).to(device),
-                                                   torch.tensor(rewards).long().to(device),
-                                                   torch.tensor(dones).long().to(device)
-                                                   )
+    states, actions, new_states, rewards, dones, predicted_next_state_loss, = \
+        tuple(map(lambda x: np.array(list(x)), zip(*transitions)))
+
+    current_model.train()
+
+    if not curiosity:
+        states, actions, new_states, rewards, dones = (torch.tensor(states).to(device),
+                                                       torch.tensor(actions).long().to(device),
+                                                       torch.tensor(new_states).to(device),
+                                                       torch.tensor(rewards).to(device),
+                                                       torch.tensor(dones).long().to(device)
+                                                       )
+    else:
+        # Instead of r = ri + re
+        # r = ri
+        states, actions, new_states, rewards, dones = (torch.tensor(states).to(device),
+                                                       torch.tensor(actions).long().to(device),
+                                                       torch.tensor(new_states).to(device),
+                                                       #  torch.tensor(rewards).to(device) +  # no extrinsic
+                                                       torch.tensor(predicted_next_state_loss).to(device),
+                                                       torch.tensor(dones).long().to(device)
+                                                       )
+
+    # Optimize agent
     optimizer.zero_grad()
 
     current_q_values = current_model(states)
@@ -51,7 +69,16 @@ def optimize(transitions: List[EagerTransition], current_model: nn.Module, targe
     loss.backward()
     optimizer.step()
 
-    return loss.data
+    # Optimize curiosity
+    if curiosity:
+        curiosity.train()
+        curiosity_optimizer.zero_grad()
+        state_loss, action_loss = curiosity(states, new_states, actions)
+        icm_loss = state_loss + action_loss
+        icm_loss.backward()
+        curiosity_optimizer.step()
+
+    return loss.data, icm_loss.data if curiosity else None
 
 
 def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
@@ -79,7 +106,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
     target_model.eval()
 
     if args.curiosity:
-        curiosity = load_icm(args, env).to(deice)
+        curiosity = load_icm(args, env).to(device)
         curiosity.eval()
 
     target_model.load_state_dict(current_model.state_dict())  # Sync/update target model
@@ -94,8 +121,13 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
         raise NotImplementedError()
 
     logging.info(current_model)
+    if args.curiosity:
+        logging.info(curiosity)
     n_params = sum(p.numel() for p in current_model.parameters() if p.requires_grad)
     logging.info(f'Training {n_params} parameters')
+    if args.curiosity:
+        n_params = sum(p.numel() for p in curiosity.parameters() if p.requires_grad)
+        logging.info(f'Training {n_params} parameters')
 
     criterion = nn.SmoothL1Loss if args.criterion == 'huber' else None
     if criterion is None:
@@ -109,9 +141,12 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
     # Adapted from Mario Martin's Notebook
     epsilon_start = 1.0
     epsilon_final = 0.01
-    epsilon_decay = 500
+    epsilon_decay = 10000
     epsilon_by_episode = lambda e: epsilon_final + (epsilon_start - epsilon_final) * math.exp(
         -1. * e / epsilon_decay)
+
+    if args.curiosity:
+        epsilon_by_episode = lambda e: 0.0  # No gamma needed if curiosity is used
 
     frame_idx = 0
 
@@ -133,7 +168,6 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
         frame_idx += 1
         episode_reward = 0.0
         episode_curiosity_reward = 0.0
-        predicted_actions = []
         steps = 0
         gamma = epsilon_by_episode(episode)
         while True:
@@ -150,16 +184,18 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
 
             episode_reward += reward
 
+            curiosity_reward = None
             if args.curiosity:
-                curiosity_reward, predicted_action = \
-                    curiosity(torch.tensor(transform(state.__array__())).unsqueeze(0),
-                              torch.tensor(transform(next_state.__array__())).unsqueeze(0).to(device),
-                              torch.tensor([action])).long()
+                with torch.no_grad():
+                    curiosity_reward, _ = \
+                        curiosity(torch.tensor(transform(state.__array__())).unsqueeze(0),
+                                  torch.tensor(transform(next_state.__array__())).unsqueeze(0).to(device),
+                                  torch.tensor([action]).long().to(device))
                 episode_curiosity_reward += curiosity_reward
-                predicted_actions.append(predicted_action)
 
             frame_idx += 1
-            buffer.push(LazyTransition(state, action, next_state, reward, done))
+            buffer.push(LazyTransition(state, action, next_state, reward, done,
+                                       curiosity_reward.numpy() if curiosity_reward is not None else None))
 
             if done:
                 writer.add_scalar('Reward/train', episode_reward, episode + 1)
@@ -168,7 +204,10 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                 all_rewards.append(episode_reward)
                 all_steps.append(steps)
                 episode_set_rewards += episode_reward
-                episode_set_steps += episode_set_steps
+                episode_set_steps += steps
+                if args.curiosity:
+                    writer.add_scalar('Curiosity/train', episode_curiosity_reward, episode + 1)
+                    episode_set_curiosity_rewards += episode_curiosity_reward
 
             state = next_state
             steps += 1
@@ -177,26 +216,38 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                 env.render()
 
             if done:
-                logging.info(f'Finished episode {episode+1} with reward = {episode_reward+1} | steps = {steps+1} | '
+                logging.info(f'Finished episode {episode+1} with reward = {episode_reward:.2f} | steps = {steps+1} | '
                              f'gamma = {gamma:.2f}')
+                if args.curiosity:
+                    logging.info(f'curiosity = {curiosity_reward:.2f}')
                 break
 
-        if buffer.full and episode % args.optimize_freq == 0:  # len(buffer) >= args.batch_size:
+        if buffer.full and (episode+1) % args.optimize_freq == 0:  # len(buffer) >= args.batch_size:
 
             transitions = buffer.sample(args.batch_size)
 
-            optimize(transitions, current_model, target_model, optimizer, device, args.gamma, args.criterion)
+            if not args.curiosity:
+                q_loss, _ = optimize(transitions, current_model, target_model, optimizer, device, args.gamma,
+                                     args.criterion)
+            else:
+                q_loss, curiosity_loss = optimize(transitions, current_model, target_model, optimizer, device,
+                                                  args.gamma, args.criterion, curiosity, curiosity_optimizer)
 
-            mean_episode_set_rewards = episode_set_rewards / args.optimize_freq
-            mean_episode_set_steps = episode_set_steps / args.optimize_freq
+            mean_episode_set_rewards = episode_set_rewards / (args.optimize_freq-1)
+            mean_episode_set_steps = episode_set_steps / (args.optimize_freq-1)
             writer.add_scalar('Mean-Reward/train', mean_episode_set_rewards, optimizations + 1)
             writer.add_scalar('Mean-Steps/train', mean_episode_set_steps, optimizations + 1)
+            writer.add_scalar('Q-Loss/train', q_loss, optimizations + 1)
+            if args.curiosity:
+                writer.add_scalar('Curiosity-Loss/train', curiosity_loss, optimizations + 1)
             all_mean_rewards.append(mean_episode_set_rewards)
             all_mean_steps.append(mean_episode_set_steps)
             episode_set_rewards = 0.0
             episode_set_steps = 0
 
             torch.save(current_model.state_dict(), os.path.join(exp_dir, 'checkpoint_last.pt'))
+            if args.curiosity:
+                torch.save(curiosity.state_dict(), os.path.join(exp_dir, 'curiosity_checkpoint_last.pt'))
 
             logging.info(f'Optimized model ({optimizations+1} optimizations)')
             optimizations += 1
@@ -215,8 +266,12 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                 if args.early_stop != -1 and episodes_without_improvement == args.early_stop:
                     break
             logging.info(f'{episodes_without_improvement} episodes without improvement')
+        elif not buffer.full and episode % args.optimize_freq == 0:
+            # First iteration: buffer not full. This messes up the logs (no other effect).
+            episode_set_rewards = 0.0
+            episode_set_steps = 0.0
 
-        if buffer.full and episode % args.update_target_freq == 0:
+        if buffer.full and (episode+1) % args.update_target_freq == 0:
             target_model.load_state_dict(current_model.state_dict())
             logging.info(f'Updated target model (updates {updates})')
             updates += 1

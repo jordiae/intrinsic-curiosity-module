@@ -11,6 +11,7 @@ from typing import Dict
 import logging
 import time
 from statistics import stdev
+from typing import Optional
 
 
 class ArgsStruct:
@@ -53,14 +54,15 @@ def load_vae(args: argparse.Namespace, env: gym.Env) -> nn.Module:
 
 def load_icm(args: argparse.Namespace, env: gym.Env) -> nn.Module:
     from .model import IntrinsicCuriosity
+    n_actions = env.action_space.n
     input_channels, input_height, input_width = env.observation_space.shape
 
     if args.arch == 'cnn':
-        return IntrinsicCuriosity(n_actions=args.n_actions, icm_state_features=args.icm_state_features,
+        return IntrinsicCuriosity(n_actions=n_actions, icm_state_features=args.z_size,
                                   icm_hidden_size=args.icm_hidden_size, icm_n_hidden=args.icm_n_hidden,
                                   input_height=input_height, input_width=input_width,
                                   input_channels=input_channels, dropout=args.dropout, batch_norm=args.batch_norm,
-                                  n_conv=args.n_conv)
+                                  n_conv=args.conv_layers)
 
     else:
         raise NotImplementedError(args.model)
@@ -78,6 +80,7 @@ class EagerTransition:
     next_state: np.ndarray
     reward: float
     done: bool
+    predicted_next_state_loss: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -87,10 +90,11 @@ class LazyTransition:
     next_state: wrappers.LazyFrames
     reward: float
     done: bool
+    predicted_next_state_loss: Optional[np.ndarray]
 
     def eager(self) -> EagerTransition:
         return EagerTransition(transform(self.state.__array__()), self.action, transform(self.next_state.__array__()),
-                               self.reward, self.done)
+                               self.reward, self.done, self.predicted_next_state_loss)
 
 
 class ReplayBuffer:

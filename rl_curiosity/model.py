@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from typing import Tuple
+from typing import Tuple, List
 
 
 class CNNEncoder(nn.Module):
@@ -112,7 +112,7 @@ class CNNDecoder(nn.Module):
         x = x.view(x.shape[0], self.channels, self.view_shape[0], self.view_shape[1])
         for layer in self.deconv:
             x = layer(x)
-        return x
+        return torch.tanh(x)
 
 
 class ControllerHead(nn.Module):
@@ -197,61 +197,103 @@ class VAE(nn.Module):
 
         self.fc_mu = nn.Linear(self.encoder.feature_vec_size, self.z_size)
         self.fc_log_var = nn.Linear(self.encoder.feature_vec_size, self.z_size)
+
         self.fc_z_dc = nn.Linear(self.z_size, self.encoder.feature_vec_size)
 
         self.decoder = CNNDecoder(self.encoder.feature_vec_size, self.encoder.last_height, self.encoder.last_width,
                                   self.dropout, self.batch_norm, self.n_conv, self.input_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.encode(x)
+        z = self.fc_z_dc(z)
+        return self.decode(z)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)
         mu, log_var = self.fc_mu(h), self.fc_log_var(h)
         z = self._reparameterize(mu, log_var)
-        z = self.fc_z_dc(z)
-        return self.decoder(z)
+        return z
+
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(x)
 
     def _reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def only_encode(self):
+        del self.fc_z_dc
+        del self.decoder
+
 
 class InverseModel(nn.Module):
-    def __init__(self, n_actions: int, state_features: int, hidden_size: int, n_hidden: int):
+    def __init__(self, n_actions: int, state_features: int, hidden_size: int, n_hidden: int, dropout: float = 0.0,
+                 batch_norm: bool = False):
         super().__init__()
         assert n_hidden > 0
         self.n_actions = n_actions
         self.state_features = state_features
         self.hidden_size = hidden_size
         self.n_hidden = n_hidden
-        self.mlp = nn.Sequential(nn.Linear(self.state_features * 2, self.hidden_size),
-                                 *[nn.Linear(self.hidden_size, self.hidden_size) for _ in range(self.n_hidden)],
+        self.dropout = dropout
+        self.batch_norm = batch_norm
+        self.mlp = nn.Sequential(self._build_layer(self.state_features*2, self.hidden_size),
+                                 *[self._build_layer(self.hidden_size, self.hidden_size) for _ in range(self.n_hidden)],
                                  nn.Linear(self.hidden_size, self.state_features))
 
+    def _build_layer(self, features_in: int, features_out: int) -> nn.Module:
+        if not self.batch_norm and self.dropout == 0.0:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.ReLU())
+        elif self.batch_norm:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.BatchNorm1d(features_out),
+                                 nn.ReLU())
+        elif dropout > 0.0:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.ReLU(), nn.Dropout(self.dropout))
+        else:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.BatchNorm1d(features_out),
+                                 nn.ReLU(), nn.Dropout(self.dropout))
+
     def forward(self, states: torch.Tensor, next_states: torch.Tensor) -> torch.Tensor:
-        features = torch.cat((states, next_states))
+        features = torch.cat((states, next_states), dim=1)
         actions = self.mlp(features)
         return actions
 
 
 class ForwardModel(nn.Module):
-    def __init__(self, n_actions: int, state_features: int, hidden_size: int, n_hidden: int):
+    def __init__(self, n_actions: int, state_features: int, hidden_size: int, n_hidden: int, dropout: float = 0.0,
+                 batch_norm: bool = False):
         super().__init__()
         assert n_hidden > 0
         self.n_actions = n_actions
         self.state_features = state_features
         self.hidden_size = hidden_size
         self.n_hidden = n_hidden
-        self.embedding_size = min(self.n_actions//2, 4)
+        self.dropout = dropout
+        self.batch_norm = batch_norm
+        self.embedding_size = max(self.n_actions//2, 4)
         self.action_embedding = nn.Embedding(self.n_actions, self.embedding_size)
-        self.mlp = nn.Sequential(nn.Linear(self.embedding_size + self.state_features, self.hidden_size),
-                                 *[nn.Linear(self.hidden_size, self.hidden_size) for _ in range(self.n_hidden)],
+        self.mlp = nn.Sequential(self._build_layer(self.embedding_size + self.state_features, self.hidden_size),
+                                 *[self._build_layer(self.hidden_size, self.hidden_size) for _ in range(self.n_hidden)],
                                  nn.Linear(self.hidden_size, self.state_features))
+
+    def _build_layer(self, features_in: int, features_out: int) -> nn.Module:
+        if not self.batch_norm and self.dropout == 0.0:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.ReLU())
+        elif self.batch_norm:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.BatchNorm1d(features_out),
+                                 nn.ReLU())
+        elif dropout > 0.0:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.ReLU(), nn.Dropout(self.dropout))
+        else:
+            return nn.Sequential(nn.Linear(features_in, features_out), nn.BatchNorm1d(features_out),
+                                 nn.ReLU(), nn.Dropout(self.dropout))
 
     def forward(self, actions: torch.Tensor, states):
         actions = self.action_embedding(actions)
-        features = torch.cat((actions, states))
+        features = torch.cat((actions, states), dim=1)
         next_states = self.mlp(features)
-        return next_states
+        return torch.tanh(next_states)
 
 
 class IntrinsicCuriosity(nn.Module):
@@ -272,8 +314,13 @@ class IntrinsicCuriosity(nn.Module):
         self.batch_norm = batch_norm
         self.n_conv = n_conv
 
-        self.encoder = CNNEncoder(self.input_height, self.input_width, self.input_channels, self.dropout,
-                                  self.batch_norm, self.n_conv)
+        self.encoder = VAE(self.input_height, self.input_width, self.input_channels, self.dropout,
+                                  self.batch_norm, self.n_conv, z_size=self.icm_state_features)
+
+        self.encoder.only_encode()
+
+        #  self.encoder = CNNEncoder(self.input_height, self.input_width, self.input_channels, self.dropout,
+        #                          self.batch_norm, self.n_conv)
 
         self.forward_model = ForwardModel(self.n_actions, self.icm_state_features, self.icm_hidden_size,
                                           self.icm_n_hidden)
@@ -287,17 +334,17 @@ class IntrinsicCuriosity(nn.Module):
     def forward(self, states: torch.Tensor, next_states: torch.Tensor, actions: torch.Tensor) -> \
             Tuple[torch.Tensor, torch.Tensor]:
         # Encoding
-        encoded_states = self.encoder(states)
-        encoded_next_states = self.encoder(next_states)
+        encoded_states = self.encoder.encode(states)
+        encoded_next_states = self.encoder.encode(next_states)
 
         # Inverse model
         predicted_actions = self.inverse_model(encoded_states, encoded_next_states)
         actions_loss = self.action_criterion(predicted_actions, actions)
 
         # Forward model
-        predicted_next_states = self.forward_model(encoded_states, actions)
+        predicted_next_states = self.forward_model(actions, encoded_states)
 
-        states_loss = self.states_criterion(predicted_next_states, next_states)
+        states_loss = self.states_criterion(predicted_next_states, encoded_next_states)
 
         return states_loss, actions_loss
 

@@ -154,9 +154,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
         -1. * e / epsilon_decay)
 
     if args.curiosity:
-        epsilon_by_episode = lambda e: 0.0  # No gamma needed if curiosity is used
-
-    frame_idx = 0
+        epsilon_by_episode = lambda e: 0.0  # No epsilon needed if curiosity is used
 
     t0 = time.time()
     all_rewards = []
@@ -175,18 +173,17 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
 
     for episode in range(args.episodes):
         state = env.reset()
-        frame_idx += 1
         episode_reward = 0.0
         episode_curiosity_reward = 0.0
         steps = 0
-        gamma = epsilon_by_episode(episode)
+        epsilon = epsilon_by_episode(episode)
 
         while True:
             current_model.eval()
             if args.curiosity:
                 curiosity.eval()
             action = current_model.act(torch.tensor(transform(state.__array__())).unsqueeze(0).to(device),
-                                       gamma,
+                                       epsilon,
                                        torch.rand(1)[0].to(device),
                                        torch.randint(0, n_actions, (1,))[0].to(device))
             current_model.train()
@@ -204,7 +201,6 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                                   torch.tensor([action]).long().to(device))
                 episode_curiosity_reward += curiosity_reward
 
-            frame_idx += 1
             buffer.push(LazyTransition(state, action, next_state, reward, done,
                                        curiosity_reward.cpu().numpy() if curiosity_reward is not None else None))
 
@@ -212,7 +208,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
                 initial_counter += 1
                 writer.add_scalar('Reward/train', episode_reward, episode + 1)
                 writer.add_scalar('Steps/train', steps, episode + 1)
-                writer.add_scalar('Gamma/train', gamma, episode + 1)
+                writer.add_scalar('Epsilon/train', epsilon, episode + 1)
                 all_rewards.append(episode_reward)
                 all_steps.append(steps)
                 episode_set_rewards += episode_reward
@@ -229,7 +225,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
 
             if done:
                 logging.info(f'Finished episode {episode+1} with reward = {episode_reward:.2f} | steps = {steps+1} | '
-                             f'gamma = {gamma:.2f}')
+                             f'epsilon = {epsilon:.2f}')
                 if args.curiosity:
                     logging.info(f'curiosity = {curiosity_reward:.2f}')
                 break
@@ -239,11 +235,11 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
             transitions = buffer.sample(args.batch_size)
 
             if not args.curiosity:
-                q_loss, _ = optimize(transitions, current_model, target_model, optimizer, device, args.gamma,
+                q_loss, _ = optimize(transitions, current_model, target_model, optimizer, device, epsilon,
                                      args.criterion)
             else:
                 q_loss, curiosity_loss = optimize(transitions, current_model, target_model, optimizer, device,
-                                                  args.gamma, args.criterion, curiosity, curiosity_optimizer)
+                                                  epsilon, args.criterion, curiosity, curiosity_optimizer)
 
             denominator = args.optimize_freq-1 if optimizations > 0 else initial_counter
             mean_episode_set_rewards = episode_set_rewards / denominator

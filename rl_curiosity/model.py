@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from typing import Tuple, List
+from typing import Tuple
 
 
 class CNNEncoder(nn.Module):

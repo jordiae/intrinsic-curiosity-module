@@ -19,7 +19,7 @@ if __name__ == '__main__':
     parser.add_argument('--early-stop', type=int,
                         help='Episode patience in early stop (-1 -> no early stop)', default=-1)
     parser.add_argument('--weight-decay', type=float, help='Weight decay', default=0.0001)
-    parser.add_argument('--dropout', type=float, help='Dropout in RNN and FC layers', default=0.25)
+    parser.add_argument('--dropout', type=float, help='Dropout in FC layers', default=0.25)
     parser.add_argument('--conv-layers', type=int, help='Number of convolutional layers', default=6)
     parser.add_argument('--fc-layers', type=int, help='Number of fully-connected layers', default=2)
     parser.add_argument('--batch-norm', action='store_true', help='Use batch normalization')

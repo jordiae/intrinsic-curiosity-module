@@ -206,7 +206,7 @@ def train(args: argparse.Namespace, env: gym.Env, exp_dir: str):
 
             frame_idx += 1
             buffer.push(LazyTransition(state, action, next_state, reward, done,
-                                       curiosity_reward.numpy() if curiosity_reward is not None else None))
+                                       curiosity_reward.cpu().numpy() if curiosity_reward is not None else None))
 
             if done:
                 initial_counter += 1
